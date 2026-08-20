@@ -2,7 +2,7 @@
 
 This repository contains the complete engineering development of two independently developed aerospace payload flight systems:
 
-1. **SUGAR CanSAT** — A competition high-altitude rocket CanSat payload system featuring an STM32-based flight computer, integrated atmospheric and inertial sensor arrays, 433 MHz RF telemetry, onboard SD data logging, and a dedicated ground receiver.
+1. **SUGAR CanSAT** — A competition high-altitude rocket CanSat payload system featuring an STM32-based flight computer, integrated atmospheric and inertial sensor arrays, 868 MHz RF telemetry, onboard SD data logging, and a dedicated ground receiver.
 2. **Rideshare Payload** — An autonomous rocket rideshare avionics and imaging system featuring an ESP32-S3 / SX1262 LoRa flight computer, 868 MHz long-range telemetry, local OLED state latching, dedicated ESP32-CAM video/still logging, and a dedicated LoRa ground receiver.
 
 Both flight payloads interface with a unified, dual-receiver ground telemetry server that captures, logs, parses, and visualizes real-time flight metrics during mission operations.
