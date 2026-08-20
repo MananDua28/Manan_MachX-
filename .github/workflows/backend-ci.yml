@@ -4,12 +4,20 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - 'backend/**'
+      - 'Shared_Ground_Station/backend/**'
+      - 'CanSAT/Firmware/Ground_Station/**'
+      - 'CanSAT/Testing/**'
+      - 'Rideshare_Payload/Firmware/Ground_Station/**'
+      - 'Rideshare_Payload/Testing/**'
       - '.github/workflows/backend-ci.yml'
   push:
     branches: [main]
     paths:
-      - 'backend/**'
+      - 'Shared_Ground_Station/backend/**'
+      - 'CanSAT/Firmware/Ground_Station/**'
+      - 'CanSAT/Testing/**'
+      - 'Rideshare_Payload/Firmware/Ground_Station/**'
+      - 'Rideshare_Payload/Testing/**'
       - '.github/workflows/backend-ci.yml'
 
 jobs:
@@ -17,7 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: backend
+        working-directory: Shared_Ground_Station/backend
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,7 +35,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: backend/package-lock.json
+          cache-dependency-path: Shared_Ground_Station/backend/package-lock.json
 
       - name: Install dependencies
         run: npm ci

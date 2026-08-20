@@ -1,0 +1,727 @@
+require('dotenv').config();
+const express = require('express');
+const http = require('http');
+const { randomUUID } = require('crypto');
+const { Server } = require('socket.io');
+const cors = require('cors');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+
+const db = require('./db');
+const serial = require('./serial');
+const { log } = require('./logger');
+const {
+  CIRCUIT,
+  NRC_PAYLOAD_CIRCUIT,
+  RIDESHARE_PAYLOAD_CIRCUIT,
+  CANSAT_MISSION_MODES,
+  CANSAT_MISSION_MODE_NAMES,
+  TELEMETRY_LIMITS,
+  decodeFlags,
+  deriveSensorHealth,
+  packetIdLimitForSource,
+  packetWarnings
+} = require('../../CanSAT/Firmware/Ground_Station/cansat-hardware');
+const { RIDESHARE_SOURCE, normalizeSource } = require('./source-aliases');
+
+const app = express();
+const server = http.createServer(app);
+const CONFIGURED_PORT = Number.parseInt(process.env.PORT || '3000', 10);
+const DEFAULT_ALLOWED_ORIGINS = [
+  `http://localhost:${CONFIGURED_PORT}`,
+  `http://127.0.0.1:${CONFIGURED_PORT}`,
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+  'null'
+];
+const allowedOrigins = (process.env.CORS_ORIGINS || DEFAULT_ALLOWED_ORIGINS.join(','))
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const corsOptions = {
+  origin(origin, cb) {
+    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return cb(null, true);
+    const error = new Error('Origin not allowed by CORS');
+    error.status = 403;
+    cb(error);
+  }
+};
+const io = new Server(server, { cors: corsOptions });
+
+const SD_UPLOAD_MAX_FILE_BYTES = Math.max(
+  Number.parseInt(process.env.SD_UPLOAD_MAX_FILE_BYTES || '5242880', 10) || 5242880,
+  1024
+);
+const SD_UPLOAD_MAX_ROWS = Math.max(
+  Number.parseInt(process.env.SD_UPLOAD_MAX_ROWS || '50000', 10) || 50000,
+  100
+);
+const TELEMETRY_SOURCES = new Set(['CANSAT', RIDESHARE_SOURCE, 'MACHX', 'SUGAR']);
+const EXPORT_SOURCES = new Set(['CANSAT', RIDESHARE_SOURCE, 'ALL', 'MACHX', 'SUGAR']);
+
+const upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: SD_UPLOAD_MAX_FILE_BYTES },
+  fileFilter: (req, file, cb) => {
+    const extension = path.extname(file.originalname || '').toLowerCase();
+    if (extension !== '.csv') {
+      cb(new HttpError(400, 'Only .csv files are accepted for SD upload'));
+      return;
+    }
+    cb(null, true);
+  }
+});
+
+app.use(cors(corsOptions));
+app.use(express.json({ limit: '1mb' }));
+app.use('/vendor', express.static(path.resolve(__dirname, 'node_modules/three/build')));
+app.use('/images', express.static(path.resolve(__dirname, '../images')));
+
+let uptimeStart = Date.now();
+let shuttingDown = false;
+
+class HttpError extends Error {
+  constructor(status, message, details = {}) {
+    super(message);
+    this.name = 'HttpError';
+    this.status = status;
+    this.details = details;
+  }
+}
+
+function parseSource(value, allowedSet, fallback) {
+  const candidate = normalizeSource(value, fallback);
+  if (!allowedSet.has(candidate)) {
+    throw new HttpError(400, 'Invalid source parameter', {
+      source: candidate,
+      allowed: [...allowedSet, 'NRC']
+    });
+  }
+  return candidate;
+}
+
+function parseBoundedInt(value, fallback, min, max, field) {
+  const parsed = Number.parseInt(value, 10);
+  const effective = Number.isNaN(parsed) ? fallback : parsed;
+  if (!Number.isInteger(effective) || effective < min || effective > max) {
+    throw new HttpError(400, `Invalid ${field} parameter`, { field, min, max });
+  }
+  return effective;
+}
+
+function parseRequiredBoundedInt(value, min, max, field) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new HttpError(400, `Invalid ${field} parameter`, { field, min, max });
+  }
+  return parsed;
+}
+
+function csvEscape(value) {
+  if (value === null || value === undefined) return '';
+  const asString = String(value);
+  if (/[,"\n]/.test(asString)) return `"${asString.replace(/"/g, '""')}"`;
+  return asString;
+}
+
+function parseCsvRecords(content) {
+  const records = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < content.length; i++) {
+    const ch = content[i];
+    const next = content[i + 1];
+
+    if (ch === '"') {
+      if (inQuotes && next === '"') {
+        field += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === ',' && !inQuotes) {
+      row.push(field.trim());
+      field = '';
+      continue;
+    }
+
+    if ((ch === '\n' || ch === '\r') && !inQuotes) {
+      if (ch === '\r' && next === '\n') i++;
+      row.push(field.trim());
+      if (row.some((value) => value !== '')) records.push(row);
+      row = [];
+      field = '';
+      continue;
+    }
+
+    field += ch;
+  }
+
+  row.push(field.trim());
+  if (row.some((value) => value !== '')) records.push(row);
+  if (inQuotes) throw new HttpError(400, 'CSV contains an unterminated quoted field');
+  return records;
+}
+
+function normalizeHeader(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+}
+
+function makeHeaderLookup(headers) {
+  const lookup = new Map();
+  headers.forEach((header, index) => lookup.set(normalizeHeader(header), index));
+  return lookup;
+}
+
+function getCsvValue(row, lookup, names) {
+  for (const name of names) {
+    const index = lookup.get(name);
+    if (index !== undefined) return row[index];
+  }
+  return undefined;
+}
+
+const STRICT_FLOAT_PATTERN = /^[+-]?(?:(?:\d+(?:\.\d*)?)|(?:\.\d+))(?:[eE][+-]?\d+)?$/;
+const STRICT_INT_PATTERN = /^[+-]?\d+$/;
+
+function parseStrictCsvFloat(value) {
+  const normalized = String(value ?? '').trim();
+  if (!STRICT_FLOAT_PATTERN.test(normalized)) return NaN;
+  const parsed = Number(normalized);
+  return Number.isFinite(parsed) ? parsed : NaN;
+}
+
+function parseStrictCsvInt(value) {
+  const normalized = String(value ?? '').trim();
+  if (!STRICT_INT_PATTERN.test(normalized)) return NaN;
+  const parsed = Number(normalized);
+  return Number.isSafeInteger(parsed) ? parsed : NaN;
+}
+
+function parseRequiredCsvFloat(row, lookup, names) {
+  return parseStrictCsvFloat(getCsvValue(row, lookup, names));
+}
+
+function parseRequiredCsvInt(row, lookup, names) {
+  return parseStrictCsvInt(getCsvValue(row, lookup, names));
+}
+
+function parseOptionalCsvFloat(row, lookup, names) {
+  const rawValue = getCsvValue(row, lookup, names);
+  if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') return null;
+  return parseStrictCsvFloat(rawValue);
+}
+
+function parseOptionalCsvInt(row, lookup, names) {
+  const rawValue = getCsvValue(row, lookup, names);
+  if (rawValue === undefined || rawValue === null || String(rawValue).trim() === '') return null;
+  return parseStrictCsvInt(rawValue);
+}
+
+function parseOptionalTemperatureCsvFloat(row, lookup, names) {
+  const parsed = parseOptionalCsvFloat(row, lookup, names);
+  if (parsed === null || Number.isNaN(parsed)) return parsed;
+  return parsed <= -900 ? null : parsed;
+}
+
+function inTelemetryRange(value, field) {
+  const limit = TELEMETRY_LIMITS[field];
+  if (!limit) return true;
+  return Number.isFinite(value) && value >= limit.min && value <= limit.max;
+}
+
+function packetIdInTelemetryRange(value, source) {
+  const limit = packetIdLimitForSource(source);
+  return Number.isFinite(value) && value >= limit.min && value <= limit.max;
+}
+
+function optionalInTelemetryRange(value, field) {
+  return value === null || inTelemetryRange(value, field);
+}
+
+function parseMissionModeCsv(row, lookup) {
+  const raw = getCsvValue(row, lookup, ['mission_mode', 'mode']);
+  if (raw === undefined || String(raw).trim() === '') return { id: null, name: null };
+  const value = String(raw).trim().toUpperCase();
+  if (/^\d+$/.test(value)) {
+    const id = Number.parseInt(value, 10);
+    return { id, name: CANSAT_MISSION_MODE_NAMES[id] || null };
+  }
+  const id = CANSAT_MISSION_MODES[value] ?? null;
+  return { id, name: id === null ? null : value };
+}
+
+function parseSdPacketRow(row, lookup, raw, receivedAt, source) {
+  const accelZ = parseOptionalCsvFloat(row, lookup, ['accel_z', 'acceleration_z']);
+  const gyroX = parseOptionalCsvFloat(row, lookup, ['gyro_x', 'gyroscope_x']);
+  const csvGpsOk = parseOptionalCsvInt(row, lookup, ['gps_fix', 'gps_ok']);
+  const csvBmpOk = parseOptionalCsvInt(row, lookup, ['bmp_ok', 'baro_ok']);
+  const csvSdOk = parseOptionalCsvInt(row, lookup, ['sd_ok', 'sd_card_ok']);
+  const rssiRaw = getCsvValue(row, lookup, ['rssi_dbm', 'rssi']);
+  const rssiDbm = rssiRaw === undefined || String(rssiRaw).trim() === ''
+    ? 0
+    : parseStrictCsvInt(rssiRaw);
+  const protocolRaw = getCsvValue(row, lookup, ['protocol_version', 'version']);
+  const protocolVersion = protocolRaw === undefined || String(protocolRaw).trim() === ''
+    ? null
+    : parseStrictCsvInt(protocolRaw);
+  const missionMode = parseMissionModeCsv(row, lookup);
+  const packet = {
+    source,
+    protocol_version: Number.isInteger(protocolVersion) ? protocolVersion : (source === 'CANSAT' && missionMode.id !== null ? 3 : null),
+    mission_mode_id: missionMode.id,
+    mission_mode: missionMode.name,
+    pkt_id: parseRequiredCsvInt(row, lookup, ['pkt_id', 'packet_id', 'id']),
+    timestamp_ms: parseRequiredCsvInt(row, lookup, ['timestamp_ms', 'time_ms', 'timestamp']),
+    altitude_m: parseRequiredCsvFloat(row, lookup, ['altitude_m', 'alt_m', 'altitude']),
+    temp_c: parseRequiredCsvFloat(row, lookup, ['temp_c', 'temperature_c', 'temperature']),
+    temp_c_1: parseOptionalTemperatureCsvFloat(row, lookup, ['temp_c_1', 'temperature_c_1', 'lm75_temp_c']),
+    temp_c_2: parseOptionalTemperatureCsvFloat(row, lookup, ['temp_c_2', 'temperature_c_2']),
+    temp_c_3: parseOptionalTemperatureCsvFloat(row, lookup, ['temp_c_3', 'temperature_c_3']),
+    temp_c_4: parseOptionalTemperatureCsvFloat(row, lookup, ['temp_c_4', 'temperature_c_4']),
+    pressure_hpa: parseRequiredCsvFloat(row, lookup, ['pressure_hpa', 'pressure']),
+    accel_z: accelZ,
+    gyro_x: gyroX,
+    lat: parseRequiredCsvFloat(row, lookup, ['lat', 'latitude']),
+    lon: parseRequiredCsvFloat(row, lookup, ['lon', 'lng', 'longitude']),
+    flags: parseRequiredCsvInt(row, lookup, ['flags', 'flag']),
+    rssi_dbm: rssiDbm,
+    raw,
+    received_at: receivedAt
+  };
+
+  if (source === RIDESHARE_SOURCE) {
+    const healthColumns = [
+      { value: csvGpsOk, bit: 0x04 },
+      { value: csvBmpOk, bit: 0x08 },
+      { value: csvSdOk, bit: 0x20 }
+    ];
+    for (const { value, bit } of healthColumns) {
+      if (value === null) continue;
+      if (value !== 0 && value !== 1) return null;
+      if (((packet.flags & bit) !== 0) !== (value === 1)) return null;
+    }
+  }
+
+  return (
+    Number.isInteger(packet.pkt_id) &&
+    packetIdInTelemetryRange(packet.pkt_id, source) &&
+    Number.isInteger(packet.timestamp_ms) &&
+    inTelemetryRange(packet.timestamp_ms, 'timestamp_ms') &&
+    inTelemetryRange(packet.altitude_m, 'altitude_m') &&
+    inTelemetryRange(packet.temp_c, 'temp_c') &&
+    optionalInTelemetryRange(packet.temp_c_1, 'temp_c_1') &&
+    optionalInTelemetryRange(packet.temp_c_2, 'temp_c_2') &&
+    optionalInTelemetryRange(packet.temp_c_3, 'temp_c_3') &&
+    optionalInTelemetryRange(packet.temp_c_4, 'temp_c_4') &&
+    inTelemetryRange(packet.pressure_hpa, 'pressure_hpa') &&
+    (source === RIDESHARE_SOURCE ? optionalInTelemetryRange(packet.accel_z, 'accel_z') : inTelemetryRange(packet.accel_z, 'accel_z')) &&
+    (source === RIDESHARE_SOURCE ? optionalInTelemetryRange(packet.gyro_x, 'gyro_x') : inTelemetryRange(packet.gyro_x, 'gyro_x')) &&
+    inTelemetryRange(packet.lat, 'lat') &&
+    inTelemetryRange(packet.lon, 'lon') &&
+    Number.isInteger(packet.rssi_dbm) &&
+    inTelemetryRange(packet.rssi_dbm, 'rssi_dbm') &&
+    Number.isInteger(packet.flags) &&
+    inTelemetryRange(packet.flags, 'flags')
+  ) ? packet : null;
+}
+
+function summarizeApogee(packets) {
+  if (!Array.isArray(packets) || packets.length === 0) return null;
+  let apogeePacket = null;
+  for (const packet of packets) {
+    if (!Number.isFinite(packet.altitude_m)) continue;
+    if (!apogeePacket || packet.altitude_m > apogeePacket.altitude_m) {
+      apogeePacket = packet;
+    }
+  }
+  if (!apogeePacket) return null;
+  return {
+    altitude_m: apogeePacket.altitude_m,
+    timestamp_ms: apogeePacket.timestamp_ms,
+    pkt_id: apogeePacket.pkt_id
+  };
+}
+
+function summarizeDurationSeconds(packets) {
+  if (!Array.isArray(packets) || packets.length === 0) return 0;
+  const times = packets
+    .map((packet) => packet.timestamp_ms)
+    .filter((timestamp) => Number.isFinite(timestamp));
+  if (times.length === 0) return 0;
+  const min = Math.min(...times);
+  const max = Math.max(...times);
+  return Math.max(0, (max - min) / 1000);
+}
+
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+app.use((req, res, next) => {
+  req.requestId = req.headers['x-request-id'] || randomUUID();
+  res.setHeader('x-request-id', req.requestId);
+  next();
+});
+
+let emitToAll = (event, payload) => {
+  if (event === 'packet') {
+    io.sockets.sockets.forEach((socket) => {
+      if (!socket.data.source || socket.data.source === 'ALL' || socket.data.source === payload.source) {
+        socket.emit(event, payload);
+      }
+    });
+    return;
+  }
+  io.emit(event, payload);
+};
+
+serial.initSerial(emitToAll);
+
+app.get('/', (req, res) => {
+  const dashPath = path.resolve(__dirname, '../dashboard/index.html');
+  if (fs.existsSync(dashPath)) {
+    res.sendFile(dashPath);
+    return;
+  }
+  res.send('<h1 style="font-family:monospace;color:#00d4ff;background:#020817;padding:2rem">MACH-26 Ground Station — backend running, index not found.</h1>');
+});
+
+app.get('/avionics', (req, res) => res.redirect('/mach-x-rideshare'));
+
+function sendMachXRideshareDashboard(req, res) {
+  const dashPath = path.resolve(__dirname, '../../CanSAT/Dashboard/mach-x.html');
+  if (fs.existsSync(dashPath)) res.sendFile(dashPath);
+  else res.status(404).send('Mach-X Rideshare Dashboard missing');
+}
+
+app.get('/mach-x-rideshare', sendMachXRideshareDashboard);
+app.get('/nrc', (req, res) => res.redirect('/mach-x-rideshare'));
+
+app.get('/cansat', (req, res) => {
+  const dashPath = path.resolve(__dirname, '../../CanSAT/Dashboard/mach-x.html');
+  if (fs.existsSync(dashPath)) res.sendFile(dashPath);
+  else res.status(404).send('CanSat Dashboard missing');
+});
+
+app.get('/mach-x', (req, res) => {
+  const dashPath = path.resolve(__dirname, '../../CanSAT/Dashboard/mach-x.html');
+  if (fs.existsSync(dashPath)) res.sendFile(dashPath);
+  else res.status(404).send('Mach-X Dashboard missing');
+});
+
+app.get('/api/health', (req, res) => {
+  const signal = serial.getSignalState();
+  const cansatStats = db.getStats('CANSAT');
+  const rideshareStats = db.getStats(RIDESHARE_SOURCE);
+
+  res.json({
+    status: 'ok',
+    uptime_s: Math.floor((Date.now() - uptimeStart) / 1000),
+    serial_connected: Boolean(signal.CANSAT.connected || signal.RIDESHARE?.connected || signal.NRC?.connected || signal.MACHX.connected),
+    db_packet_count: cansatStats.count + rideshareStats.count,
+    signal
+  });
+});
+
+app.get('/api/cansat/hardware', (req, res) => {
+  res.json({
+    ok: true,
+    circuit: CIRCUIT
+  });
+});
+
+app.get('/api/nrc/hardware', (req, res) => {
+  res.json({
+    ok: true,
+    circuit: RIDESHARE_PAYLOAD_CIRCUIT
+  });
+});
+
+app.get('/api/rideshare/hardware', (req, res) => {
+  res.json({
+    ok: true,
+    circuit: RIDESHARE_PAYLOAD_CIRCUIT
+  });
+});
+
+app.get('/api/cansat/status', (req, res) => {
+  const latest = db.getLatest('CANSAT');
+  const signal = serial.getSignalState().CANSAT;
+  res.json({
+    ok: true,
+    signal,
+    latest: latest
+      ? {
+          ...latest,
+          flags_decoded: decodeFlags(latest.flags),
+          sensor_health: deriveSensorHealth(latest),
+          warnings: packetWarnings(latest)
+        }
+      : null
+  });
+});
+
+function sendRideshareStatus(req, res) {
+  const latest = db.getLatest(RIDESHARE_SOURCE);
+  const signal = serial.getSignalState().RIDESHARE || serial.getSignalState().NRC;
+  res.json({
+    ok: true,
+    signal,
+    latest: latest
+      ? {
+          ...latest,
+          flags_decoded: decodeFlags(latest.flags),
+          sensor_health: deriveSensorHealth(latest),
+          warnings: packetWarnings(latest)
+        }
+      : null
+  });
+}
+
+app.get('/api/nrc/status', sendRideshareStatus);
+app.get('/api/rideshare/status', sendRideshareStatus);
+
+app.get('/api/packets', (req, res) => {
+  const source = parseSource(req.query.source, TELEMETRY_SOURCES, 'CANSAT');
+  const limit = parseBoundedInt(req.query.limit, 200, 1, db.MAX_HISTORY_LIMIT, 'limit');
+  const since = parseBoundedInt(req.query.since, 0, 0, Number.MAX_SAFE_INTEGER, 'since');
+  const packets = db.getHistory(source, limit, since);
+  res.json({ source, count: packets.length, packets });
+});
+
+app.get('/api/stats', (req, res) => {
+  res.json({
+    cansat: db.getStats('CANSAT'),
+    rideshare: db.getStats(RIDESHARE_SOURCE),
+    nrc: db.getStats(RIDESHARE_SOURCE),
+    events: db.getAllEvents(),
+    uptime_s: Math.floor((Date.now() - uptimeStart) / 1000)
+  });
+});
+
+app.delete('/api/events', (req, res) => {
+  const source = parseSource(req.body?.source || req.query?.source, EXPORT_SOURCES, 'ALL');
+  const result = db.clearEvents(source);
+  const payload = {
+    ok: true,
+    source,
+    cleared: result.changes || 0
+  };
+  emitToAll('mission_log_cleared', payload);
+  res.json(payload);
+});
+
+app.post('/api/upload-sd', upload.single('file'), asyncRoute(async (req, res) => {
+  if (!req.file) throw new HttpError(400, 'No file uploaded');
+  const source = parseSource(req.body?.source || req.query?.source, new Set(['CANSAT', RIDESHARE_SOURCE]), 'CANSAT');
+
+  const now = Date.now();
+  let content = '';
+  try {
+    content = await fs.promises.readFile(req.file.path, 'utf-8');
+  } finally {
+    await fs.promises.unlink(req.file.path).catch(() => {});
+  }
+
+  const records = parseCsvRecords(content);
+  if (records.length < 2) throw new HttpError(400, 'CSV must include a header and at least one data row');
+  if (records.length - 1 > SD_UPLOAD_MAX_ROWS) {
+    throw new HttpError(413, 'CSV row count exceeds configured upload limit', { max_rows: SD_UPLOAD_MAX_ROWS });
+  }
+
+  const headerLookup = makeHeaderLookup(records[0]);
+  const packets = [];
+  let skipped = 0;
+  for (let i = 1; i < records.length; i++) {
+    const row = records[i];
+    if (row.length < 8) {
+      skipped++;
+      continue;
+    }
+
+    const packet = parseSdPacketRow(row, headerLookup, row.map(csvEscape).join(','), now, source);
+    if (!packet) {
+      skipped++;
+      continue;
+    }
+    packets.push(packet);
+  }
+
+  if (packets.length === 0) throw new HttpError(400, 'No valid telemetry rows found in uploaded CSV');
+
+  const uploadResult = db.insertUpload({
+    source,
+    filename: req.file.originalname,
+    rows_inserted: packets.length,
+    uploaded_at: now
+  });
+  const uploadId = Number(uploadResult.lastInsertRowid || uploadResult.id || 0);
+  packets.forEach((packet) => {
+    packet.upload_id = uploadId || null;
+  });
+  const insertResult = db.insertPacketsBulk(packets);
+  const inserted = insertResult.changes ?? packets.length;
+  const skippedDuplicates = insertResult.skipped_duplicates ?? 0;
+  if (uploadId && typeof db.updateUploadRowsInserted === 'function') {
+    db.updateUploadRowsInserted(uploadId, inserted);
+  }
+
+  const response = {
+    ok: true,
+    source,
+    upload_id: uploadId || null,
+    inserted,
+    skipped,
+    skipped_duplicates: skippedDuplicates,
+    duration_s: summarizeDurationSeconds(packets),
+    filename: req.file.originalname,
+    apogee: summarizeApogee(packets)
+  };
+  emitToAll('sd_upload_complete', response);
+  res.status(201).json(response);
+}));
+
+app.get('/api/sd-uploads/:upload_id/packets', (req, res) => {
+  const uploadId = parseRequiredBoundedInt(req.params.upload_id, 1, Number.MAX_SAFE_INTEGER, 'upload_id');
+  const uploadRecord = db.getUpload(uploadId);
+  if (!uploadRecord) throw new HttpError(404, 'SD upload not found', { upload_id: uploadId });
+  const packets = db.getUploadPackets(uploadId).map((packet) => ({
+    ...packet,
+    flags_decoded: decodeFlags(packet.flags),
+    sensor_health: deriveSensorHealth(packet),
+    warnings: packetWarnings(packet)
+  }));
+  res.json({
+    ok: true,
+    upload_id: uploadId,
+    source: uploadRecord.source,
+    count: packets.length,
+    packets
+  });
+});
+
+app.get('/api/export', (req, res) => {
+  const source = parseSource(req.query.source, EXPORT_SOURCES, 'CANSAT');
+  const rows = db.exportCsv(source);
+  const columns = ['id', 'source', 'protocol_version', 'mission_mode_id', 'mission_mode', 'pkt_id', 'timestamp_ms', 'altitude_m', 'temp_c', 'temp_c_1', 'temp_c_2', 'temp_c_3', 'temp_c_4', 'pressure_hpa', 'accel_z', 'gyro_x', 'lat', 'lon', 'rssi_dbm', 'flags', 'received_at'];
+  const csv = [columns.join(',')]
+    .concat(rows.map((row) => columns.map((column) => csvEscape(row[column])).join(',')))
+    .join('\n');
+
+  res.header('Content-Type', 'text/csv');
+  res.header('Content-Disposition', `attachment; filename="flight-${source}-${Date.now()}.csv"`);
+  res.send(csv);
+});
+
+io.on('connection', (socket) => {
+  try {
+    socket.emit('history', {
+      cansat: db.getHistory('CANSAT', 60),
+      rideshare: db.getHistory(RIDESHARE_SOURCE, 60),
+      nrc: db.getHistory(RIDESHARE_SOURCE, 60),
+      events: db.getAllEvents()
+    });
+  } catch (error) {
+    log('warn', 'Failed to emit initial history', { error: error.message });
+  }
+
+  socket.on('subscribe_source', (data) => {
+    if (!data || !data.source) return;
+    const source = normalizeSource(data.source);
+    if (source === 'ALL' || TELEMETRY_SOURCES.has(source)) {
+      socket.data.source = source;
+    }
+  });
+
+  socket.on('request_history', (data) => {
+    if (!data || !data.source) return;
+    try {
+      const source = parseSource(data.source, TELEMETRY_SOURCES, 'CANSAT');
+      const limit = parseBoundedInt(data.limit, 200, 1, db.MAX_HISTORY_LIMIT, 'limit');
+      socket.emit('history', {
+        source,
+        packets: db.getHistory(source, limit)
+      });
+    } catch (error) {
+      socket.emit('server_error', { message: error.message });
+    }
+  });
+});
+
+app.use((error, req, res, next) => {
+  if (error.code === 'LIMIT_FILE_SIZE') {
+    res.status(413).json({
+      ok: false,
+      error: 'Upload exceeds allowed file size',
+      code: 'LIMIT_FILE_SIZE',
+      request_id: req.requestId
+    });
+    return;
+  }
+
+  const status = error instanceof HttpError
+    ? error.status
+    : Number.isInteger(error.status)
+      ? error.status
+      : 500;
+
+  const payload = {
+    ok: false,
+    error: error.message || 'Internal server error',
+    request_id: req.requestId
+  };
+  if (error.code) payload.code = error.code;
+  if (error.details) payload.details = error.details;
+
+  if (status >= 500) {
+    log('error', 'Unhandled backend error', {
+      request_id: req.requestId,
+      path: req.path,
+      method: req.method,
+      status,
+      error: error.message
+    });
+  }
+
+  res.status(status).json(payload);
+});
+
+const PORT = CONFIGURED_PORT;
+server.listen(PORT, () => {
+  log('info', 'MACH-26 Ground Station started', { port: PORT, mode: 'hardware' });
+});
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  log('info', 'Shutting down ground station', { signal });
+
+  try {
+    await serial.shutdown();
+  } catch (error) {
+    log('warn', 'Serial shutdown reported error', { error: error.message });
+  }
+
+  try {
+    db.close();
+  } catch (error) {
+    log('warn', 'DB close reported error', { error: error.message });
+  }
+
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(1), 5000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+module.exports = { app, server };

@@ -4,12 +4,14 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - 'firmware/**'
+      - 'CanSAT/Firmware/**'
+      - 'Rideshare_Payload/Firmware/**'
       - '.github/workflows/firmware-ci.yml'
   push:
     branches: [main]
     paths:
-      - 'firmware/**'
+      - 'CanSAT/Firmware/**'
+      - 'Rideshare_Payload/Firmware/**'
       - '.github/workflows/firmware-ci.yml'
 
 jobs:
@@ -29,10 +31,22 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade platformio
 
-      - name: Build CanSat Firmware
+      - name: Build CanSat Flight Computer Firmware
         run: |
-          pio run -d firmware/cansat
+          pio run -d CanSAT/Firmware/Flight_Computer
 
-      - name: Build Ground Station Firmware
+      - name: Build CanSat Ground Station Firmware
         run: |
-          pio run -d firmware/ground-station
+          pio run -d CanSAT/Firmware/Ground_Station
+
+      - name: Build Rideshare Flight Computer Firmware
+        run: |
+          pio run -d Rideshare_Payload/Firmware/Flight_Computer
+
+      - name: Build Rideshare Ground Station Firmware
+        run: |
+          pio run -d Rideshare_Payload/Firmware/Ground_Station
+
+      - name: Build Rideshare Camera Module Firmware
+        run: |
+          pio run -d Rideshare_Payload/Firmware/Camera_Module
